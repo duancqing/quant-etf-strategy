@@ -1,0 +1,131 @@
+name: "📈 V8.7.1 国金版 ETF动量轮动 - 每周五自动信号"
+
+on:
+  schedule:
+    - cron: '45 6 * * 5'   # 每周五 14:45 北京时间 (UTC+8 → 06:45 UTC)
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: '策略模式'
+        required: false
+        default: 'final'
+        type: choice
+        options:
+          - final
+          - pure
+      broker:
+        description: '券商类型'
+        required: false
+        default: 'manual'
+        type: choice
+        options:
+          - manual
+          - ptrade
+          # 注意: qmt 模式需要本地 QMT 客户端，无法在 GitHub Actions 中运行
+      dry_run:
+        description: '干跑模式 (仅生成信号，不执行交易)'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  run-signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Setup Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: "📦 Install dependencies"
+        run: |
+          pip install --upgrade pip
+          pip install pandas numpy akshare requests urllib3
+
+      - name: "🚀 Run 国金版 strategy signal engine"
+        id: run_signal
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          GJ_BROKER_TYPE: ${{ github.event.inputs.broker || 'manual' }}
+          GJ_AUTO_TRADE: ${{ github.event.inputs.dry_run == 'false' && 'true' || 'false' }}
+          # PTrade 信号文件路径 (GitHub Actions 中通常不需要)
+          PTRADE_SIGNAL_PATH: ptrade_signal.json
+        run: |
+          STRATEGY="${{ github.event.inputs.strategy || 'final' }}"
+          BROKER="${{ github.event.inputs.broker || 'manual' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'true' }}"
+
+          echo "=========================================="
+          echo "  国金版 V8.7.1 ETF动量轮动策略"
+          echo "  策略模式: $STRATEGY"
+          echo "  券商类型: $BROKER"
+          echo "  干跑模式: $DRY_RUN"
+          echo "=========================================="
+
+          if [ "$DRY_RUN" = "true" ]; then
+            python v8_7_1_gj_trade.py --strategy $STRATEGY --broker $BROKER --dry-run 2>&1 | tee signal_output.txt
+          else
+            python v8_7_1_gj_trade.py --strategy $STRATEGY --broker $BROKER 2>&1 | tee signal_output.txt
+          fi
+
+          echo "strategy=$STRATEGY" >> $GITHUB_OUTPUT
+          echo "broker=$BROKER" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: "📋 Extract signal summary"
+        id: extract
+        run: |
+          python3 - <<'EOF'
+          import os
+          with open("signal_output.txt", "r", encoding="utf-8") as f:
+              content = f.read()
+          lines = content.split("\n")
+          summary_lines = []
+          capture = False
+          for line in lines:
+              if "LIVE DASHBOARD" in line or "V8.7.1 国金" in line:
+                  capture = True
+              if capture:
+                  summary_lines.append(line)
+          if summary_lines:
+              summary = "\n".join(summary_lines)
+          else:
+              summary = content[-2000:] if len(content) > 2000 else content
+          with open("signal_summary.txt", "w", encoding="utf-8") as f:
+              f.write(summary)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("summary<<SUMMARY_EOF\n")
+              f.write(summary[:3000])
+              f.write("\nSUMMARY_EOF\n")
+          print(f"Summary length: {len(summary)} chars")
+          EOF
+
+      - name: "💾 Commit updated portfolio state"
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "GitHub Actions Bot"
+          git add portfolio_state.json ptrade_signal.json
+          if git diff --staged --quiet; then
+            echo "No changes to state files"
+          else
+            git commit -m "🤖 Auto-update state [$(date '+%Y-%m-%d %H:%M')]"
+            git push
+          fi
+
+      - name: "📎 Upload signal output as artifact"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gj-signal-output-${{ github.run_number }}
+          path: |
+            signal_output.txt
+            signal_summary.txt
+            portfolio_state.json
+            ptrade_signal.json
+          retention-days: 30
